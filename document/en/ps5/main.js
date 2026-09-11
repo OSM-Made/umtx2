@@ -551,20 +551,24 @@ async function main(userlandRW, wkOnly = false) {
             return krw.ktextBase.add32(offset);
         }
 
-        // Set security flags
-        let security_flags = await krw.read4(get_kaddr(OFFSET_KERNEL_SECURITY_FLAGS));
-        await krw.write4(get_kaddr(OFFSET_KERNEL_SECURITY_FLAGS), security_flags | 0x14);
+        let target_id = await krw.read1(get_kaddr(OFFSET_KERNEL_TARGETID));
+        let is_devkit = (target_id === 0x82 || target_id === 0x81);
 
-        // Set targetid to DEX
-        await krw.write1(get_kaddr(OFFSET_KERNEL_TARGETID), 0x82);
+        if (is_devkit) {
+            await log("Devkit/Testkit detected (TargetID=0x" + target_id.toString(16) + "), skipping debug patches", LogLevel.INFO);
+        } else {
+            let security_flags = await krw.read4(get_kaddr(OFFSET_KERNEL_SECURITY_FLAGS));
+            await krw.write4(get_kaddr(OFFSET_KERNEL_SECURITY_FLAGS), security_flags | 0x14);
 
-        // Set qa flags and utoken flags for debug menu enable
-        let qaf_dword = await krw.read4(get_kaddr(OFFSET_KERNEL_QA_FLAGS));
-        await krw.write4(get_kaddr(OFFSET_KERNEL_QA_FLAGS), qaf_dword | 0x10300);
+            await krw.write1(get_kaddr(OFFSET_KERNEL_TARGETID), 0x82);
 
-        let utoken_flags = await krw.read1(get_kaddr(OFFSET_KERNEL_UTOKEN_FLAGS));
-        await krw.write1(get_kaddr(OFFSET_KERNEL_UTOKEN_FLAGS), utoken_flags | 0x1);
-        await log("Enabled debug menu", LogLevel.INFO);
+            let qaf_dword = await krw.read4(get_kaddr(OFFSET_KERNEL_QA_FLAGS));
+            await krw.write4(get_kaddr(OFFSET_KERNEL_QA_FLAGS), qaf_dword | 0x10300);
+
+            let utoken_flags = await krw.read1(get_kaddr(OFFSET_KERNEL_UTOKEN_FLAGS));
+            await krw.write1(get_kaddr(OFFSET_KERNEL_UTOKEN_FLAGS), utoken_flags | 0x1);
+            await log("Enabled debug menu", LogLevel.INFO);
+        }
 
         // Patch creds
         let cur_uid = await chain.syscall(SYS_GETUID);
