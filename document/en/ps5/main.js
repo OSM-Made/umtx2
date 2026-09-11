@@ -554,12 +554,20 @@ async function main(userlandRW, wkOnly = false) {
         let target_id = await krw.read1(get_kaddr(OFFSET_KERNEL_TARGETID));
         let is_devkit = (target_id === 0x82 || target_id === 0x81);
 
-        if (is_devkit) {
-            await log("Devkit/Testkit detected (TargetID=0x" + target_id.toString(16) + "), skipping debug patches", LogLevel.INFO);
-        } else {
-            let security_flags = await krw.read4(get_kaddr(OFFSET_KERNEL_SECURITY_FLAGS));
-            await krw.write4(get_kaddr(OFFSET_KERNEL_SECURITY_FLAGS), security_flags | 0x14);
+        let security_flags = await krw.read4(get_kaddr(OFFSET_KERNEL_SECURITY_FLAGS));
+        await krw.write4(get_kaddr(OFFSET_KERNEL_SECURITY_FLAGS), security_flags | 0x14);
 
+        if (is_devkit) {
+            await log("Devkit/Testkit detected (TargetID=0x" + target_id.toString(16) + ")", LogLevel.INFO);
+
+            let qaf0 = await krw.read1(get_kaddr(OFFSET_KERNEL_QA_FLAGS));
+            await krw.write1(get_kaddr(OFFSET_KERNEL_QA_FLAGS), qaf0 | 0x04);
+
+            let qaf1 = await krw.read1(get_kaddr(OFFSET_KERNEL_QA_FLAGS).add32(1));
+            await krw.write1(get_kaddr(OFFSET_KERNEL_QA_FLAGS).add32(1), qaf1 | 0x03);
+
+            await log("Applied devkit QA flags", LogLevel.INFO);
+        } else {
             await krw.write1(get_kaddr(OFFSET_KERNEL_TARGETID), 0x82);
 
             let qaf_dword = await krw.read4(get_kaddr(OFFSET_KERNEL_QA_FLAGS));
