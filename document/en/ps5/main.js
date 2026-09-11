@@ -561,10 +561,10 @@ async function main(userlandRW, wkOnly = false) {
             await log("Devkit/Testkit detected (TargetID=0x" + target_id.toString(16) + ")", LogLevel.INFO);
 
             let qaf0 = await krw.read1(get_kaddr(OFFSET_KERNEL_QA_FLAGS));
-            await krw.write1(get_kaddr(OFFSET_KERNEL_QA_FLAGS), qaf0 | 0x04);
+            await krw.write1(get_kaddr(OFFSET_KERNEL_QA_FLAGS), qaf0 | 0x0C); // 0x04 = Int Dev, 0x08 = Allow Registry Access
 
             let qaf1 = await krw.read1(get_kaddr(OFFSET_KERNEL_QA_FLAGS).add32(1));
-            await krw.write1(get_kaddr(OFFSET_KERNEL_QA_FLAGS).add32(1), qaf1 | 0x03);
+            await krw.write1(get_kaddr(OFFSET_KERNEL_QA_FLAGS).add32(1), qaf1 | 0x03); // 0x01 = UL Debugger, 0x02 = SL Debugger
 
             await log("Applied devkit QA flags", LogLevel.INFO);
         } else {
