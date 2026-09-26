@@ -878,6 +878,7 @@ async function main(userlandRW, wkOnly = false) {
             is_elfldr_running = true;
 
             try {
+                await new Promise(resolve => setTimeout(resolve, 2000));
                 await log("Sending HV defeat payload to elfldr...", LogLevel.LOG);
                 if (!send_buffer_to_port.sock_addr_store) {
                     send_buffer_to_port.sock_addr_store = p.malloc(0x10, 1);
