@@ -11,26 +11,64 @@ on:
       - 'payload/hv_defeat/**'
   workflow_dispatch:
 
+permissions:
+  contents: write
+
+env:
+  PS5_PAYLOAD_SDK: /tmp/ps5-payload-sdk
+  SDK_REPO: ps5-payload-dev/sdk
+  SDK_REF: main
+
 jobs:
   build:
     runs-on: ubuntu-latest
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
 
-      - name: Install build tools
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y ninja-build cmake
+          sudo apt-get install -y ninja-build cmake wget
+          # Ensure unversioned LLVM tools exist
+          for tool in clang clang++ ld.lld llvm-config llvm-objcopy llvm-strip; do
+            if ! command -v "$tool" &>/dev/null; then
+              VERSIONED="$(ls /usr/bin/${tool}-* 2>/dev/null | sort -V | tail -1)"
+              [ -n "$VERSIONED" ] && sudo ln -sf "$VERSIONED" "/usr/bin/$tool"
+            fi
+          done
+          clang --version | head -1
+          llvm-config --version
 
-      - name: Fetch PS5 Payload SDK
+      - name: Cache PS5 SDK
+        id: sdk-cache
+        uses: actions/cache@v4
+        with:
+          path: /tmp/ps5-payload-sdk
+          key: ps5-sdk-${{ hashFiles('.github/workflows/build-payload.yml') }}
+
+      - name: Build PS5 Payload SDK
+        if: steps.sdk-cache.outputs.cache-hit != 'true'
         run: |
-          git clone --depth 1 https://github.com/ps5-payload-dev/sdk.git /tmp/ps5-payload-sdk
+          git clone --depth=1 https://github.com/$SDK_REPO.git /tmp/ps5-sdk-src
+          cd /tmp/ps5-sdk-src
+
+          make clean install DESTDIR="$PS5_PAYLOAD_SDK"
+
+          # Build libc++ (libunwind, libc++abi, libc++)
+          export PS5_PAYLOAD_SDK
+          bash libcxx.sh
+
+          # Verify
+          test -f "$PS5_PAYLOAD_SDK/toolchain/prospero.cmake"
+          test -f "$PS5_PAYLOAD_SDK/target/lib/crt1.o"
+          test -f "$PS5_PAYLOAD_SDK/target/lib/libc++.a"
+          echo "PS5 Payload SDK installed to $PS5_PAYLOAD_SDK"
 
       - name: Configure
         working-directory: payload/hv_defeat
-        env:
-          PS5_PAYLOAD_SDK: /tmp/ps5-payload-sdk
         run: cmake --preset CI
 
       - name: Build
