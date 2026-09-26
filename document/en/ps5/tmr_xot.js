@@ -128,29 +128,29 @@ async function discoverNpt(krw, dmap, log) {
             var ptrPA = hvDataPA.add32(OFFSET_HV_VCPU + c * OFFSET_HV_VCPU_CPUID);
             var vmcbVA = await krw.read8(dmapVA(dmap, ptrPA));
 
-            if (c < 2) log("vcpu[" + c + "] ptr=0x" + vmcbVA.toString(16), LogLevel.LOG);
+            if (c < 4) log("vcpu[" + c + "] raw=0x" + vmcbVA.toString(16), LogLevel.LOG);
 
             if (!isKernelVA(vmcbVA)) continue;
 
             var ncr3 = await readNcr3FromVmcb(krw, dmap, vmcbVA);
-            if (c < 2) log("vcpu[" + c + "] ncr3=" + (ncr3 ? "0x" + ncr3.toString(16) : "null"), LogLevel.LOG);
             if (!ncr3) continue;
 
             log("nCR3=0x" + ncr3.toString(16) + " (core " + c + ")", LogLevel.INFO);
             return ncr3;
         }
 
-        log("No valid VMCB found via vcpu walk, trying DMAP scan...", LogLevel.LOG);
-        var scanPA = hvDataPA;
-        for (var off = 0; off < 0x40000; off += 0x1000) {
-            var probe = await krw.read8(dmapVA(dmap, scanPA.add32(off)));
-            if (!isKernelVA(probe)) continue;
+        log("vcpu walk failed, scanning HV data for VMCB nCR3...", LogLevel.LOG);
+        for (var off = 0; off < 0x100000; off += 0x1000) {
+            var candidate = await krw.read8(dmapVA(dmap, hvDataPA.add32(off + VMCB_NCR3)));
+            if (candidate.low === 0 && candidate.hi === 0) continue;
+            if ((candidate.low & 0xFFF) !== 0) continue;
+            if (candidate.hi > 0xF) continue;
 
-            var ncr3 = await readNcr3FromVmcb(krw, dmap, probe);
-            if (!ncr3) continue;
+            var pml4e0 = await krw.read8(dmapVA(dmap, candidate));
+            if (!(pml4e0.low & PTE_PRESENT)) continue;
 
-            log("nCR3=0x" + ncr3.toString(16) + " (scan off=0x" + off.toString(16) + ")", LogLevel.INFO);
-            return ncr3;
+            log("nCR3=0x" + candidate.toString(16) + " (scan off=0x" + off.toString(16) + ")", LogLevel.INFO);
+            return candidate;
         }
     } else {
         var hvBssPA = i64add(hvDataPA, new int64(OFFSET_HV_BSS_OFF, 0));
