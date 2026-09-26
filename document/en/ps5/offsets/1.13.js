@@ -389,3 +389,12 @@ const OFFSET_KERNEL_PRISON0                     = 0x03451E00; // data = 0x01911E
 const OFFSET_KERNEL_ROOTVNODE                   = 0x080A5540; // data = 0x06565540
 
 // const OFFSET_KERNEL_PS4SDK						= 0x30E3338;
+// HV/TMR offsets
+const OFFSET_KERNEL_DMPML4I                     = 0x04ADF540;
+const OFFSET_KERNEL_DMPDPI                      = 0x04ADF544;
+const OFFSET_KERNEL_PML4PML4I                   = 0x04ADF29C;
+const OFFSET_KERNEL_PMAP_STORE                  = 0x04ADF2B8;
+const OFFSET_KERNEL_TEXT_SIZE                    = 0x00B30000;
+const OFFSET_HV_VCPU                            = 0x1398;
+const OFFSET_HV_VCPU_CPUID                      = 0x128;
+const OFFSET_KERNEL_PMAP_PM_PML4                = 0x020;
