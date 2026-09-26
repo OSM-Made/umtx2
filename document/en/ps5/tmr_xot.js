@@ -9,7 +9,7 @@ const TMR_DATA_OFF    = 0x84;
 const TMR_MAX         = 22;
 const TMR_CFG_PERMISSIVE = 0x3F07;
 const VMCB_NCR3       = 0xB0;
-const SYS_MDBG_SERVICE = 0x259;
+
 
 const PTE_PRESENT  = 0x001;
 const PTE_WRITE    = 0x002;
