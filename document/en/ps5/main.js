@@ -879,6 +879,9 @@ async function main(userlandRW, wkOnly = false) {
 
             try {
                 await log("Sending HV defeat payload to elfldr...", LogLevel.LOG);
+                if (!send_buffer_to_port.sock_addr_store) {
+                    send_buffer_to_port.sock_addr_store = p.malloc(0x10, 1);
+                }
                 let hv_sz = await load_payload_into_elf_store_from_local_file("hv_defeat.elf");
                 await send_buffer_to_port(elf_store, hv_sz, 9021);
                 await log("HV defeat payload sent", LogLevel.INFO);
