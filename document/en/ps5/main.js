@@ -627,7 +627,7 @@ async function main(userlandRW, wkOnly = false) {
         // Stage: TMR/XOT Defeat (FW 1.00-4.51)
         ///////////////////////////////////////////////////////////////////////
         if (window.fw_float <= 4.51) {
-            await disableTmrAndXot(krw, chain, log);
+            await disableTmrAndXot(krw, chain, log, p);
         }
 
         ///////////////////////////////////////////////////////////////////////
