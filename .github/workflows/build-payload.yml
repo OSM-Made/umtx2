@@ -42,3 +42,13 @@ jobs:
         with:
           name: hv_defeat
           path: payload/hv_defeat/Build/hv_defeat.elf
+
+      - name: Deploy to payloads
+        if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+        run: |
+          cp payload/hv_defeat/Build/hv_defeat.elf document/en/ps5/payloads/hv_defeat.elf
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add document/en/ps5/payloads/hv_defeat.elf
+          git diff --cached --quiet || git commit -m "Update hv_defeat.elf payload"
+          git push
