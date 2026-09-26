@@ -624,13 +624,6 @@ async function main(userlandRW, wkOnly = false) {
         }
 
         ///////////////////////////////////////////////////////////////////////
-        // Stage: TMR/XOT Defeat (FW 1.00-4.51)
-        ///////////////////////////////////////////////////////////////////////
-        if (window.fw_float <= 4.51) {
-            await disableTmrAndXot(krw, chain, log, p);
-        }
-
-        ///////////////////////////////////////////////////////////////////////
         // Stage 6: loader
         ///////////////////////////////////////////////////////////////////////
 
@@ -883,6 +876,15 @@ async function main(userlandRW, wkOnly = false) {
         if (await load_local_elf("elfldr-ps5.elf") == 0) {
             await log(`elfldr listening on ${ip.ip}:9021`, LogLevel.INFO);
             is_elfldr_running = true;
+
+            try {
+                await log("Sending HV defeat payload to elfldr...", LogLevel.LOG);
+                let hv_sz = await load_payload_into_elf_store_from_local_file("hv_defeat.elf");
+                await send_buffer_to_port(elf_store, hv_sz, 9021);
+                await log("HV defeat payload sent", LogLevel.INFO);
+            } catch (error) {
+                await log("Failed to send HV defeat payload: " + error, LogLevel.ERROR);
+            }
         } else {
             await log("elfldr exited with non-zero code, port 9021 will likely not work", LogLevel.ERROR);
             await new Promise(resolve => setTimeout(resolve, 1000));

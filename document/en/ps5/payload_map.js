@@ -31,17 +31,6 @@ const payload_map = [
     //     supportedFirmwares: ["1.", "2.", "3.", "4.", "5."]
     // },
     {
-        displayTitle: "HV Defeat",
-        description: "Disables TMR, defeats NPT via IOMMU, sets kernel text RWX",
-        fileName: "hv_defeat.elf",
-        author: "OSM-Made",
-        projectSource: "",
-        binarySource: "",
-        version: "1.0",
-        supportedFirmwares: ["1.", "2.", "3.", "4."],
-        toPort: 9021
-    },
-    {
         displayTitle: "etaHEN",
         description: "AIO HEN",
         fileName: "etaHEN-2.4B.bin",

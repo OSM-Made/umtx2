@@ -396,12 +396,3 @@ const OFFSET_KERNEL_DATA_BASE_QA_FLAGS          = 0x06241098;
 const OFFSET_KERNEL_DATA_BASE_UTOKEN_FLAGS      = 0x06241100;
 const OFFSET_KERNEL_DATA_BASE_PRISON0           = 0x01911E00;
 const OFFSET_KERNEL_DATA_BASE_ROOTVNODE         = 0x06565540;
-// HV/TMR offsets
-const OFFSET_KERNEL_DMPML4I                     = 0x04ADF540;
-const OFFSET_KERNEL_DMPDPI                      = 0x04ADF544;
-const OFFSET_KERNEL_PML4PML4I                   = 0x04ADF29C;
-const OFFSET_KERNEL_PMAP_STORE                  = 0x04ADF2B8;
-const OFFSET_KERNEL_TEXT_SIZE                    = 0x00B30000;
-const OFFSET_HV_VCPU                            = 0x1398;
-const OFFSET_HV_VCPU_CPUID                      = 0x128;
-const OFFSET_KERNEL_PMAP_PM_PML4                = 0x020;
