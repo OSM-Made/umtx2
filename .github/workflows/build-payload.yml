@@ -1,0 +1,44 @@
+name: Build HV Defeat Payload
+
+on:
+  push:
+    branches: ["main"]
+    paths:
+      - 'payload/hv_defeat/**'
+      - '.github/workflows/build-payload.yml'
+  pull_request:
+    paths:
+      - 'payload/hv_defeat/**'
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build cmake
+
+      - name: Fetch PS5 Payload SDK
+        run: |
+          git clone --depth 1 https://github.com/ps5-payload-dev/sdk.git /tmp/ps5-payload-sdk
+
+      - name: Configure
+        working-directory: payload/hv_defeat
+        env:
+          PS5_PAYLOAD_SDK: /tmp/ps5-payload-sdk
+        run: cmake --preset CI
+
+      - name: Build
+        working-directory: payload/hv_defeat
+        run: cmake --build Build
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: hv_defeat
+          path: payload/hv_defeat/Build/hv_defeat.elf

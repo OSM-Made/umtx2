@@ -1,0 +1,41 @@
+{
+  "version": 3,
+  "configurePresets": [
+    {
+      "name": "PS5",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/Build",
+      "environment": {
+        "PS5_PAYLOAD_SDK": "/run/media/greg/A684B7A884B778FF/Code/ps5-payload-sdk"
+      },
+      "cacheVariables": {
+        "CMAKE_TOOLCHAIN_FILE": "${sourceDir}/cmake/ps5-toolchain.cmake",
+        "PS5_PAYLOAD_SDK": "$env{PS5_PAYLOAD_SDK}",
+        "CMAKE_MAKE_PROGRAM": "/usr/bin/ninja",
+        "PS5_HOST": "1.1.0.11",
+        "PS5_PORT": "9021"
+      }
+    },
+    {
+      "name": "CI",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/Build",
+      "cacheVariables": {
+        "CMAKE_TOOLCHAIN_FILE": "${sourceDir}/cmake/ps5-toolchain.cmake",
+        "CMAKE_MAKE_PROGRAM": "ninja"
+      }
+    }
+  ],
+  "buildPresets": [
+    {
+      "name": "Debug",
+      "configurePreset": "PS5",
+      "configuration": "Debug"
+    },
+    {
+      "name": "Release",
+      "configurePreset": "PS5",
+      "configuration": "Release"
+    }
+  ]
+}
